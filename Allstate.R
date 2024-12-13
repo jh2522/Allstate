@@ -1,18 +1,16 @@
 library(tidyverse)
 library(tidymodels)
 library(parsnip)
-library(bart)
+library(bonsai)
 library(dbarts)
 library(stacks)
 library(ranger)
 library(rpart)
-library(glmnet)
-library(poissonreg)
 library(patchwork)
-library(GGally)
-library(skimr)
-library(DataExplorer)
+library(glmnet)
 library(vroom)
+library(embed)
+library(DataExplorer)
 sample <- "sampleSubmission.csv"
 test <- "test.csv"
 train <- "train.csv"
@@ -67,22 +65,142 @@ mycleandata12 <- train1 %>%
 plot_correlation(mycleandata12)
 mycleandata13 <- train1 %>% 
   select(cont1,cont2,cont3,cont4,cont5,cont6,cont7,cont8,loss)
+mycleandata14
 plot_correlation(mycleandata13)
 mycleandata14 <- train1 %>% 
   select(cont9,cont10,cont11,cont12,cont13,cont14,loss)
 plot_correlation(mycleandata14)
 mycleandata <- train1 %>% 
-  select(cat1,cat2,cat3,cat4,cat5,cat6,cat7,cat9,cat10,cat11,cat12,cat13,cat16,cat23,cat28,cat36,cat38,cat40,cat50,cat57,cat72,cat73,cat76,cat79,cat80,cat81,cat82,cat87,cat90,cat100,cat101,cat112,cat114,cat115,cont2,cont3,cont7,cont11,cont12,loss)
+  select(cat1,cat2,cat3,cat4,cat5,cat6,cat7,cat9,cat10,
+         cat11,cat12,cat13,cat16,cat23,cat28,cat36,cat38,
+         cat40,cat50,cat57,cat72,cat73,cat76,cat79,cat80,
+         cat81,cat82,cat87,cat90,cat100,cat101,cat112,
+         cat114,cat115,cont2,cont3,cont7,cont11,cont12,loss) %>% 
+  mutate(loss=log(loss))
+train2 <- train1 %>% 
+  mutate(loss=log(loss))
 mycleandata
 mytestdata <- test1 %>% 
-  select(cat1,cat2,cat3,cat4,cat5,cat6,cat7,cat9,cat10,cat11,cat12,cat13,cat16,cat23,cat28,cat36,cat38,cat40,cat50,cat57,cat72,cat73,cat76,cat79,cat80,cat81,cat82,cat87,cat90,cat100,cat101,cat112,cat114,cat115,cont2,cont3,cont7,cont11,cont12)
+  select(cat1,cat2,cat3,cat4,cat5,cat6,cat7,cat9,cat10,
+         cat11,cat12,cat13,cat16,cat23,cat28,cat36,cat38,
+         cat40,cat50,cat57,cat72,cat73,cat76,cat79,cat80,
+         cat81,cat82,cat87,cat90,cat100,cat101,cat112,
+         cat114,cat115,cont2,cont3,cont7,cont11,cont12)
 
 colnames(mycleandata)
 colnames(mytestdata)
+
+#recipe
+
+my_recipe <- recipe(loss~., data=mycleandata) %>% 
+  step_lencode_mixed(all_nominal_predictors(), outcome=vars(loss)) %>% 
+  step_normalize(all_numeric_predictors()) 
+  #step_pca(all_predictors(),threshold=.8)
+baked <- prep(my_recipe)
+spuds <- bake(baked, new_data = mycleandata)
+spuds
+
+#linear
+
 my_linear_model <- linear_reg() %>% #create linear model
   set_engine("lm") %>% 
   set_mode("regression") %>% 
   fit(formula=loss ~ .,data=mycleandata)
 my_linear_model
-bike_predictions <- predict(my_linear_model,
+loss_predictions <- predict(my_linear_model,
                             new_data=mytestdata)
+loss_predictions
+loss_predictions <- exp(loss_predictions)
+kaggle_submission <- loss_predictions %>% 
+  bind_cols(., test1) %>% 
+  select(id, .pred) %>% 
+  rename(loss=.pred)
+vroom_write(x=kaggle_submission, file="./Allstatelinear.csv", delim=",") #upload a csv file
+
+#forest
+
+my_mod_for <- rand_forest(mtry = 10,
+                          min_n = 30,
+                          trees=100) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+forest_wf <- workflow() %>% 
+  add_recipe(my_recipe) %>% 
+  add_model(my_mod_for)
+
+grid_of_tuning_params_for <- grid_regular(mtry(range=c(1,18)), min_n(), levels = 5)
+folds_for <- vfold_cv(mycleandata, v = 5,repeats=1)
+
+CV_results_for <- forest_wf %>% 
+  tune_grid(resamples=folds_for,
+            grid=grid_of_tuning_params_for,
+            metrics=metric_set(mae),
+            control = untunedModel)
+
+bestTune_for <- CV_results_for %>% 
+  select_best(metric="mae")
+
+final_wf_for <- forest_wf %>% 
+  #finalize_workflow(bestTune_for) %>% 
+  fit(data=train2)
+
+predict_for <- final_wf_for %>% 
+  predict(new_data=test1)
+predict_for <- exp(predict_for)
+
+kaggle_submission <- predict_for %>% 
+  bind_cols(., test1) %>% 
+  select(id, .pred) %>% 
+  rename(loss=.pred)
+vroom_write(x=kaggle_submission, file="./Allstateforest.csv", delim=",") #upload a csv file
+
+#Barts
+
+my_mod_bar <- parsnip::bart(trees = 100,
+                            prior_outcome_range = 3
+)  %>% 
+  set_engine("dbarts") %>% 
+  set_mode("regression")
+
+
+preg_wf_bar <- workflow() %>% 
+  add_recipe(my_recipe) %>% 
+  add_model(my_mod_bar)
+
+final_wf_bar <- preg_wf_bar %>% 
+  fit(data=mycleandata)
+
+predict_bar <- final_wf_bar %>% 
+  predict(new_data=mytestdata)
+predict_bar <- exp(predict_bar)
+
+kaggle_submission <- predict_bar %>% 
+  bind_cols(., test1) %>% 
+  select(id, .pred) %>% 
+  rename(loss=.pred)
+vroom_write(x=kaggle_submission, file="./Allstatebart.csv", delim=",") #upload a csv file
+
+#Boost
+
+boost_model <- boost_tree(tree_depth=10, trees=400,learn_rate = .10) %>% 
+  set_engine("lightgbm") %>% 
+  set_mode("regression")
+
+boost_wf <- workflow() %>% 
+  add_recipe(my_recipe) %>% 
+  add_model(boost_model)
+
+final_wf_boost <- 
+  boost_wf %>% 
+  fit(data=mycleandata)
+
+predict_boost <- final_wf_boost %>% 
+  predict(new_data=mytestdata)
+predict_boost <- exp(predict_boost)
+
+kaggle_submission <- predict_boost %>% 
+  bind_cols(., test1) %>% 
+  select(id, .pred) %>% 
+  rename(loss=.pred)
+vroom_write(x=kaggle_submission, file="./Allstateboost.csv", delim=",") #upload a csv file
